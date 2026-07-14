@@ -29,7 +29,9 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"])
 TARGET_CHAT_ID = os.environ["TARGET_CHAT_ID"]
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODELS = [m for m in [os.environ.get("GEMINI_MODEL", "")] if m] + [
+    "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash",
+]
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 STATE_FILE = "state.json"
@@ -135,13 +137,22 @@ def summarize_gemini(messages):
 {corpus}
 --- 메시지 끝 ---"""
 
-    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-           f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}")
-    res = http_json(url, {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 2048},
-    })
-    return res["candidates"][0]["content"]["parts"][0]["text"].strip()
+    last_err = None
+    for model in GEMINI_MODELS:
+        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+               f"{model}:generateContent?key={GEMINI_API_KEY}")
+        try:
+            res = http_json(url, {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.3,
+                                     "maxOutputTokens": 2048},
+            }, retries=1)
+            print(f"gemini model used: {model}")
+            return res["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err
 
 
 def summarize_rules(messages):
