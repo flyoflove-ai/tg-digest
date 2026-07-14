@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-PDF 즉시 요약 봇 v3
-  - 대용량 PDF 지원: 4MB 초과 시 Gemini Files API로 업로드 후 요약 (한도 대폭 확대)
-  - 에러 진단 강화: HTTP 에러 본문을 로그에 그대로 출력 (원인 즉시 확인 가능)
-  - 429(무료 한도) 시 자동 대기 후 재시도
+PDF 즉시 요약 봇 v4
+  - 모델 자동 탐색: 실행 시 ListModels로 내 키가 쓸 수 있는 Flash 모델을 조회해
+    최신순으로 자동 시도. 구글이 모델 라인업을 바꿔도 코드 수정 불필요.
+  - 할당량 0인 모델(limit: 0)은 대기 없이 즉시 건너뜀
+  - 대용량 PDF: 4MB 초과 시 Files API 업로드 방식
 
 필요 Secrets: PDF_BOT_TOKEN / ALLOWED_CHAT_ID / GEMINI_API_KEY
+선택 Secret:  GEMINI_MODEL (특정 모델 강제 지정 시)
 """
 
 import base64
@@ -20,11 +22,10 @@ from datetime import datetime, timezone, timedelta
 
 KST = timezone(timedelta(hours=9))
 STATE_FILE = "state_pdf.json"
-MAX_PDF_BYTES = 18_000_000     # Files API 사용으로 상향 (텔레그램 봇 다운로드 한도 20MB)
-INLINE_THRESHOLD = 4_000_000   # 이 크기 이하만 inline, 초과는 Files API
+MAX_PDF_BYTES = 18_000_000
+INLINE_THRESHOLD = 4_000_000
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com"
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
 
 PROMPT = """당신은 한국 주식시장을 담당하는 시니어 애널리스트입니다.
 첨부된 PDF(증권사 리포트, 공시, 뉴스, IR 자료 등)를 읽고 아래 형식으로 요약하세요.
@@ -42,8 +43,9 @@ plain text + 이모지 불릿(▪, •)만 사용. 정보 골격이 유지되도
 
 
 # ---------------------------------------------------------------- http
-def _do_request(url, data=None, headers=None, timeout=300):
-    req = urllib.request.Request(url, data=data, headers=headers or {})
+def _do_request(url, data=None, headers=None, timeout=300, method=None):
+    req = urllib.request.Request(url, data=data, headers=headers or {},
+                                 method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.read(), dict(r.headers)
@@ -66,9 +68,12 @@ def http_json(url, payload=None, headers=None, retries=3, timeout=300):
             return json.loads(raw.decode())
         except RuntimeError as e:
             last = e
-            if "HTTP 429" in str(e):   # 무료 한도: 대기 후 재시도
-                print("⏳ 429 rate limit, 30초 대기 후 재시도")
-                time.sleep(30)
+            msg = str(e)
+            if "HTTP 429" in msg:
+                if "limit: 0" in msg:      # 할당량 자체가 0 → 재시도 무의미
+                    raise
+                print("⏳ 429 rate limit, 35초 대기 후 재시도")
+                time.sleep(35)
                 continue
             if i == retries - 1:
                 raise
@@ -79,6 +84,11 @@ def http_json(url, payload=None, headers=None, retries=3, timeout=300):
                 raise
             time.sleep(2 * (i + 1))
     raise last
+
+
+def http_get_json(url):
+    raw, _ = _do_request(url, timeout=60)
+    return json.loads(raw.decode())
 
 
 def http_bytes(url):
@@ -129,9 +139,60 @@ def validate_config():
     return token, chat_id, gemini
 
 
+# ---------------------------------------------------------------- 모델 자동 탐색
+def _version_key(model_id):
+    """모델명에서 버전 숫자 추출 → 최신 우선 정렬용. 예: gemini-3.1-flash → 3.1"""
+    m = re.search(r"gemini-(\d+(?:\.\d+)?)", model_id)
+    return float(m.group(1)) if m else 0.0
+
+
+def discover_models(key):
+    """내 키로 쓸 수 있는 generateContent 지원 flash 모델을 최신순으로 반환."""
+    forced = clean(os.environ.get("GEMINI_MODEL"))
+    models, page_token = [], ""
+    try:
+        while True:
+            url = f"{GEMINI_BASE}/v1beta/models?key={key}&pageSize=200"
+            if page_token:
+                url += f"&pageToken={page_token}"
+            res = http_get_json(url)
+            models += res.get("models", [])
+            page_token = res.get("nextPageToken", "")
+            if not page_token:
+                break
+    except Exception as e:
+        print(f"⚠️ 모델 목록 조회 실패({e}) → 기본 후보로 진행", file=sys.stderr)
+        fallback = ["gemini-3-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash"]
+        return ([forced] if forced else []) + fallback
+
+    usable = []
+    for m in models:
+        mid = m.get("name", "").replace("models/", "")
+        methods = m.get("supportedGenerationMethods", [])
+        if "generateContent" not in methods:
+            continue
+        if "flash" not in mid:
+            continue
+        # 텍스트 요약에 부적합한 변형 제외
+        if any(x in mid for x in ("image", "tts", "audio", "live",
+                                  "embedding", "exp", "thinking")):
+            continue
+        usable.append(mid)
+
+    # 최신 버전 우선, 같은 버전이면 일반(flash) > lite
+    usable.sort(key=lambda x: (-_version_key(x), "lite" in x, len(x)))
+    if forced and forced in usable:
+        usable.remove(forced)
+    ordered = ([forced] if forced else []) + usable[:6]
+    print(f"🔎 사용 가능 모델 (시도 순서): {ordered}")
+    if not ordered:
+        raise RuntimeError("이 키로 쓸 수 있는 flash 모델이 없습니다. "
+                           "https://aistudio.google.com 에서 키 상태를 확인하세요.")
+    return ordered
+
+
 # ---------------------------------------------------------------- gemini
 def gemini_upload(key, raw, filename):
-    """Files API 업로드 (resumable) → file_uri 반환. 대용량 PDF용."""
     start_headers = {
         "X-Goog-Upload-Protocol": "resumable",
         "X-Goog-Upload-Command": "start",
@@ -156,12 +217,11 @@ def gemini_upload(key, raw, filename):
     name, uri, state = finfo["name"], finfo["uri"], finfo.get("state", "")
     print(f"✅ Files API 업로드 완료: {name} (state={state})")
 
-    # PDF 처리 완료(ACTIVE) 대기 (최대 120초)
     waited = 0
     while state == "PROCESSING" and waited < 120:
         time.sleep(5)
         waited += 5
-        st = http_json(f"{GEMINI_BASE}/v1beta/{name}?key={key}", retries=1)
+        st = http_get_json(f"{GEMINI_BASE}/v1beta/{name}?key={key}")
         state = st.get("state", "")
     if state not in ("ACTIVE", ""):
         raise RuntimeError(f"업로드 파일 처리 실패 (state={state})")
@@ -171,7 +231,8 @@ def gemini_upload(key, raw, filename):
 def extract_text(res):
     cands = res.get("candidates") or []
     if not cands:
-        raise RuntimeError(f"응답에 candidates 없음: {json.dumps(res, ensure_ascii=False)[:400]}")
+        raise RuntimeError(
+            f"응답에 candidates 없음: {json.dumps(res, ensure_ascii=False)[:400]}")
     parts = cands[0].get("content", {}).get("parts", [])
     text = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
     if not text:
@@ -180,7 +241,7 @@ def extract_text(res):
     return text
 
 
-def summarize_pdf(key, raw, filename):
+def summarize_pdf(key, models, raw, filename):
     if len(raw) > INLINE_THRESHOLD:
         print(f"ℹ️ 대용량 PDF ({len(raw)/1e6:.1f}MB) → Files API 사용")
         uri = gemini_upload(key, raw, filename)
@@ -192,7 +253,7 @@ def summarize_pdf(key, raw, filename):
 
     parts = [{"text": PROMPT + f"\n\n파일명: {filename}"}, pdf_part]
     last_err = None
-    for model in GEMINI_MODELS:
+    for model in models:
         try:
             res = http_json(
                 f"{GEMINI_BASE}/v1beta/models/{model}:generateContent?key={key}",
@@ -203,7 +264,7 @@ def summarize_pdf(key, raw, filename):
             print(f"✅ gemini model used: {model}")
             return extract_text(res)
         except Exception as e:
-            print(f"⚠️ {model} 실패: {e}", file=sys.stderr)
+            print(f"⚠️ {model} 실패: {str(e)[:300]}", file=sys.stderr)
             last_err = e
             continue
     raise last_err
@@ -232,6 +293,7 @@ def is_pdf(doc):
 # ---------------------------------------------------------------- main
 def main():
     token, allowed_id, gemini_key = validate_config()
+    models = discover_models(gemini_key)
     api = f"https://api.telegram.org/bot{token}"
     file_api = f"https://api.telegram.org/file/bot{token}"
 
@@ -278,7 +340,7 @@ def main():
                 info = http_json(f"{api}/getFile", {"file_id": doc["file_id"]})
                 raw = http_bytes(f"{file_api}/{info['result']['file_path']}")
                 print(f"📥 다운로드 완료: {fname} ({len(raw)/1e6:.1f}MB)")
-                summary = summarize_pdf(gemini_key, raw, fname)
+                summary = summarize_pdf(gemini_key, models, raw, fname)
                 header = (f"📑 PDF 요약: {fname}\n"
                           f"🕐 {datetime.now(KST).strftime('%Y-%m-%d %H:%M')} KST\n"
                           + "─" * 20 + "\n")
