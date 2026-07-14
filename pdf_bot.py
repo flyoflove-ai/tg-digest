@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-PDF 즉시 요약 봇 v4
-  - 모델 자동 탐색: 실행 시 ListModels로 내 키가 쓸 수 있는 Flash 모델을 조회해
-    최신순으로 자동 시도. 구글이 모델 라인업을 바꿔도 코드 수정 불필요.
-  - 할당량 0인 모델(limit: 0)은 대기 없이 즉시 건너뜀
-  - 대용량 PDF: 4MB 초과 시 Files API 업로드 방식
+요약 봇 v5 — PDF + 유튜브 링크 요약 (하나의 봇으로 통합)
+  - PDF 첨부      → 문서 요약 (4MB 초과 시 Files API)
+  - 유튜브 링크    → Gemini가 영상을 직접 시청하고 요약 (자막 없어도 가능, 공개 영상만)
+  - 모델 자동 탐색: 내 키가 쓸 수 있는 flash 모델을 실행 시 조회, 최신순 시도
 
-필요 Secrets: PDF_BOT_TOKEN / ALLOWED_CHAT_ID / GEMINI_API_KEY
-선택 Secret:  GEMINI_MODEL (특정 모델 강제 지정 시)
+필요 Secrets: PDF_BOT_TOKEN / ALLOWED_CHAT_ID / GEMINI_API_KEY (기존 그대로, 추가 없음)
 """
 
 import base64
@@ -27,7 +25,11 @@ INLINE_THRESHOLD = 4_000_000
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com"
 
-PROMPT = """당신은 한국 주식시장을 담당하는 시니어 애널리스트입니다.
+YOUTUBE_RE = re.compile(
+    r"(https?://(?:www\.|m\.)?(?:youtube\.com/(?:watch\?[^ \n]*v=[\w-]{6,}|shorts/[\w-]{6,}|live/[\w-]{6,})|youtu\.be/[\w-]{6,})[^\s]*)"
+)
+
+PDF_PROMPT = """당신은 한국 주식시장을 담당하는 시니어 애널리스트입니다.
 첨부된 PDF(증권사 리포트, 공시, 뉴스, IR 자료 등)를 읽고 아래 형식으로 요약하세요.
 
 1) 문서 개요 (2~3줄): 발행 주체, 날짜, 문서 성격, 핵심 결론
@@ -40,6 +42,22 @@ PROMPT = """당신은 한국 주식시장을 담당하는 시니어 애널리스
 
 규칙: 표/차트 안의 숫자도 반영. 마크다운 특수문자(*, #, `) 없이
 plain text + 이모지 불릿(▪, •)만 사용. 정보 골격이 유지되도록 충분히 상세하게."""
+
+YT_PROMPT = """당신은 한국 주식시장을 담당하는 시니어 애널리스트입니다.
+첨부된 유튜브 영상을 시청하고 아래 형식으로 요약하세요.
+
+1) 영상 개요 (2~3줄): 채널/화자, 주제, 핵심 결론
+2) 핵심 내용 (시간 순서대로, 항목별 2~4줄 상세하게)
+   - 언급된 수치, 목표주가, 전망치는 절대 생략하지 말 것
+   - 화자의 주장(의견)과 인용된 사실(데이터/발표)을 구분해 표기
+   - 주요 구간은 [분:초] 타임스탬프 표기
+3) 언급 종목/기업: 종목명 + 맥락 + 화자의 방향성(긍정/부정/중립)
+4) 투자 시사점 & 반대 논리: 이 영상의 주장을 따를 때의 포인트와,
+   반대로 생각해볼 리스크/반론
+5) 체크할 트리거/일정: 영상에서 언급된 향후 이벤트
+
+규칙: 마크다운 특수문자(*, #, `) 없이 plain text + 이모지 불릿(▪, •)만 사용.
+영상이 길어도 정보 골격이 유지되도록 충분히 상세하게."""
 
 
 # ---------------------------------------------------------------- http
@@ -70,7 +88,7 @@ def http_json(url, payload=None, headers=None, retries=3, timeout=300):
             last = e
             msg = str(e)
             if "HTTP 429" in msg:
-                if "limit: 0" in msg:      # 할당량 자체가 0 → 재시도 무의미
+                if "limit: 0" in msg:
                     raise
                 print("⏳ 429 rate limit, 35초 대기 후 재시도")
                 time.sleep(35)
@@ -141,13 +159,11 @@ def validate_config():
 
 # ---------------------------------------------------------------- 모델 자동 탐색
 def _version_key(model_id):
-    """모델명에서 버전 숫자 추출 → 최신 우선 정렬용. 예: gemini-3.1-flash → 3.1"""
     m = re.search(r"gemini-(\d+(?:\.\d+)?)", model_id)
     return float(m.group(1)) if m else 0.0
 
 
 def discover_models(key):
-    """내 키로 쓸 수 있는 generateContent 지원 flash 모델을 최신순으로 반환."""
     forced = clean(os.environ.get("GEMINI_MODEL"))
     models, page_token = [], ""
     try:
@@ -168,26 +184,22 @@ def discover_models(key):
     usable = []
     for m in models:
         mid = m.get("name", "").replace("models/", "")
-        methods = m.get("supportedGenerationMethods", [])
-        if "generateContent" not in methods:
+        if "generateContent" not in m.get("supportedGenerationMethods", []):
             continue
         if "flash" not in mid:
             continue
-        # 텍스트 요약에 부적합한 변형 제외
         if any(x in mid for x in ("image", "tts", "audio", "live",
                                   "embedding", "exp", "thinking")):
             continue
         usable.append(mid)
 
-    # 최신 버전 우선, 같은 버전이면 일반(flash) > lite
     usable.sort(key=lambda x: (-_version_key(x), "lite" in x, len(x)))
     if forced and forced in usable:
         usable.remove(forced)
     ordered = ([forced] if forced else []) + usable[:6]
     print(f"🔎 사용 가능 모델 (시도 순서): {ordered}")
     if not ordered:
-        raise RuntimeError("이 키로 쓸 수 있는 flash 모델이 없습니다. "
-                           "https://aistudio.google.com 에서 키 상태를 확인하세요.")
+        raise RuntimeError("이 키로 쓸 수 있는 flash 모델이 없습니다.")
     return ordered
 
 
@@ -241,17 +253,7 @@ def extract_text(res):
     return text
 
 
-def summarize_pdf(key, models, raw, filename):
-    if len(raw) > INLINE_THRESHOLD:
-        print(f"ℹ️ 대용량 PDF ({len(raw)/1e6:.1f}MB) → Files API 사용")
-        uri = gemini_upload(key, raw, filename)
-        pdf_part = {"file_data": {"mime_type": "application/pdf",
-                                  "file_uri": uri}}
-    else:
-        pdf_part = {"inline_data": {"mime_type": "application/pdf",
-                                    "data": base64.b64encode(raw).decode()}}
-
-    parts = [{"text": PROMPT + f"\n\n파일명: {filename}"}, pdf_part]
+def gemini_generate(key, models, parts):
     last_err = None
     for model in models:
         try:
@@ -268,6 +270,27 @@ def summarize_pdf(key, models, raw, filename):
             last_err = e
             continue
     raise last_err
+
+
+def summarize_pdf(key, models, raw, filename):
+    if len(raw) > INLINE_THRESHOLD:
+        print(f"ℹ️ 대용량 PDF ({len(raw)/1e6:.1f}MB) → Files API 사용")
+        uri = gemini_upload(key, raw, filename)
+        pdf_part = {"file_data": {"mime_type": "application/pdf",
+                                  "file_uri": uri}}
+    else:
+        pdf_part = {"inline_data": {"mime_type": "application/pdf",
+                                    "data": base64.b64encode(raw).decode()}}
+    return gemini_generate(key, models,
+                           [{"text": PDF_PROMPT + f"\n\n파일명: {filename}"},
+                            pdf_part])
+
+
+def summarize_youtube(key, models, url):
+    print(f"🎬 유튜브 영상 요약 시작: {url}")
+    return gemini_generate(key, models,
+                           [{"text": YT_PROMPT},
+                            {"file_data": {"file_uri": url}}])
 
 
 # ---------------------------------------------------------------- state
@@ -307,6 +330,7 @@ def main():
     state = load_state()
     offset = state.get("offset", 0)
     processed = 0
+    now_kst = lambda: datetime.now(KST).strftime("%Y-%m-%d %H:%M")
 
     while True:
         res = http_json(f"{api}/getUpdates",
@@ -325,37 +349,56 @@ def main():
                 continue
 
             doc = msg.get("document")
-            if not is_pdf(doc):
-                if msg.get("text"):
-                    reply(chat_id, "📄 PDF 파일을 첨부해서 보내주시면 요약해드립니다.\n"
-                                   "(최대 18MB, 답장까지 보통 5~15분 소요)")
+            text = (msg.get("text") or msg.get("caption") or "").strip()
+            yt = YOUTUBE_RE.search(text) if text else None
+
+            # ---- PDF 처리
+            if is_pdf(doc):
+                fname = doc.get("file_name", "문서.pdf")
+                if doc.get("file_size", 0) > MAX_PDF_BYTES:
+                    reply(chat_id, f"⚠️ {fname}: 18MB를 초과해 처리할 수 없습니다.")
+                    continue
+                try:
+                    info = http_json(f"{api}/getFile",
+                                     {"file_id": doc["file_id"]})
+                    raw = http_bytes(f"{file_api}/{info['result']['file_path']}")
+                    print(f"📥 다운로드 완료: {fname} ({len(raw)/1e6:.1f}MB)")
+                    summary = summarize_pdf(gemini_key, models, raw, fname)
+                    reply(chat_id, f"📑 PDF 요약: {fname}\n🕐 {now_kst()} KST\n"
+                                   + "─" * 20 + "\n" + summary)
+                    processed += 1
+                except Exception as e:
+                    print(f"🔴 pdf failed: {e}", file=sys.stderr)
+                    reply(chat_id, f"🔴 {fname} 요약 실패. 잠시 후 다시 보내보세요.")
                 continue
 
-            fname = doc.get("file_name", "문서.pdf")
-            if doc.get("file_size", 0) > MAX_PDF_BYTES:
-                reply(chat_id, f"⚠️ {fname}: 18MB를 초과해 처리할 수 없습니다.")
+            # ---- 유튜브 처리
+            if yt:
+                url = yt.group(1)
+                try:
+                    summary = summarize_youtube(gemini_key, models, url)
+                    reply(chat_id, f"🎬 영상 요약\n{url}\n🕐 {now_kst()} KST\n"
+                                   + "─" * 20 + "\n" + summary)
+                    processed += 1
+                except Exception as e:
+                    print(f"🔴 youtube failed: {e}", file=sys.stderr)
+                    reply(chat_id, "🔴 영상 요약 실패. 비공개/멤버십 영상이거나 "
+                                   "너무 긴 영상일 수 있습니다. 잠시 후 다시 시도해보세요.")
                 continue
 
-            try:
-                info = http_json(f"{api}/getFile", {"file_id": doc["file_id"]})
-                raw = http_bytes(f"{file_api}/{info['result']['file_path']}")
-                print(f"📥 다운로드 완료: {fname} ({len(raw)/1e6:.1f}MB)")
-                summary = summarize_pdf(gemini_key, models, raw, fname)
-                header = (f"📑 PDF 요약: {fname}\n"
-                          f"🕐 {datetime.now(KST).strftime('%Y-%m-%d %H:%M')} KST\n"
-                          + "─" * 20 + "\n")
-                reply(chat_id, header + summary)
-                processed += 1
-            except Exception as e:
-                print(f"🔴 pdf processing failed: {e}", file=sys.stderr)
-                reply(chat_id, f"🔴 {fname} 요약 실패. 잠시 후 다시 보내보세요.")
+            # ---- 그 외 텍스트: 사용법 안내
+            if text:
+                reply(chat_id, "이렇게 보내주시면 요약해드립니다:\n"
+                               "📄 PDF 파일 첨부 (최대 18MB)\n"
+                               "🎬 유튜브 링크 (공개 영상)\n"
+                               "답장까지 보통 5~15분 소요됩니다.")
 
         if len(updates) < 100:
             break
 
     state["offset"] = offset
     save_state(state)
-    print(f"✅ 완료: PDF {processed}건 처리, offset={offset}")
+    print(f"✅ 완료: {processed}건 처리, offset={offset}")
 
 
 if __name__ == "__main__":
