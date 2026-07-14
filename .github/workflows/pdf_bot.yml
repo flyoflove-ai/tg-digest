@@ -1,0 +1,50 @@
+name: PDF Summary Bot
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # 10분 간격 폴링
+  workflow_dispatch: {}       # 수동 실행 테스트용
+
+permissions:
+  contents: write             # state_pdf.json 커밋용
+
+concurrency:
+  group: pdf-bot
+  cancel-in-progress: false
+
+jobs:
+  pdf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run PDF bot
+        env:
+          PDF_BOT_TOKEN: ${{ secrets.PDF_BOT_TOKEN }}
+          ALLOWED_CHAT_ID: ${{ secrets.ALLOWED_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python pdf_bot.py
+
+      - name: Commit state checkpoint
+        run: |
+          git config user.name "pdf-bot"
+          git config user.email "pdf-bot@users.noreply.github.com"
+          git pull --rebase || true
+          git add state_pdf.json || true
+          git diff --cached --quiet || git commit -m "chore: update pdf bot offset [skip ci]"
+          git push || true
+
+      - name: Failure alert to Telegram
+        if: failure()
+        env:
+          PDF_BOT_TOKEN: ${{ secrets.PDF_BOT_TOKEN }}
+          ALLOWED_CHAT_ID: ${{ secrets.ALLOWED_CHAT_ID }}
+        run: |
+          curl -s "https://api.telegram.org/bot${PDF_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${ALLOWED_CHAT_ID}" \
+            --data-urlencode text="🔴 PDF 요약 봇 실패: run ${{ github.run_id }}"
