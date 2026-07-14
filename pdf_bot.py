@@ -29,6 +29,11 @@ YOUTUBE_RE = re.compile(
     r"(https?://(?:www\.|m\.)?(?:youtube\.com/(?:watch\?[^ \n]*v=[\w-]{6,}|shorts/[\w-]{6,}|live/[\w-]{6,})|youtu\.be/[\w-]{6,})[^\s]*)"
 )
 
+def canonical_youtube(url):
+    """live/shorts/youtu.be/공유링크를 정식 watch?v= 형태로 변환."""
+    m = re.search(r"(?:v=|youtu\.be/|shorts/|live/)([\w-]{6,})", url)
+    return f"https://www.youtube.com/watch?v={m.group(1)}" if m else url
+
 PDF_PROMPT = """당신은 한국 주식시장을 담당하는 시니어 애널리스트입니다.
 첨부된 PDF(증권사 리포트, 공시, 뉴스, IR 자료 등)를 읽고 아래 형식으로 요약하세요.
 
@@ -285,8 +290,8 @@ def summarize_pdf(key, models, raw, filename):
                            [{"text": PDF_PROMPT + f"\n\n파일명: {filename}"},
                             pdf_part])
 
-
 def summarize_youtube(key, models, url):
+    url = canonical_youtube(url)
     print(f"🎬 유튜브 영상 요약 시작: {url}")
     return gemini_generate(key, models,
                            [{"text": YT_PROMPT},
