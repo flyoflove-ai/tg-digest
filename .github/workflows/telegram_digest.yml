@@ -40,7 +40,9 @@ jobs:
           git config user.name "digest-bot"
           git config user.email "digest-bot@users.noreply.github.com"
           git add state.json || true
-          git diff --cached --quiet || git commit -m "chore: update offset checkpoint [skip ci]"
+          git add digests/ || true
+          git diff --cached --quiet || git commit -m "chore: state + digest [skip ci]"
+          git pull --rebase --autostash || true
           git push || true
 
       - name: Failure alert to Telegram
@@ -51,5 +53,4 @@ jobs:
         run: |
           curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TARGET_CHAT_ID}" \
-            --data-urlencode text="🔴 텔레방 요약 워크플로 실패: ${{ github.workflow }} / run ${{ github.run_id }}"
-
+            --data-urlencode text="?? 텔레방 요약 워크플로 실패: ${{ github.workflow }} / run ${{ github.run_id }}"
