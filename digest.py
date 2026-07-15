@@ -204,10 +204,30 @@ def build_gemini_parts(messages):
     return parts
 
 
+def discover_gemini_models():
+    """ListModels API로 사용 가능한 flash 모델 조회 (v3.1) — 모델 지원 종료 대응."""
+    try:
+        res = http_json("https://generativelanguage.googleapis.com/v1beta/models"
+                        f"?key={GEMINI_API_KEY}&pageSize=200")
+        names = [m["name"].split("/")[-1] for m in res.get("models", [])
+                 if "generateContent" in m.get("supportedGenerationMethods", [])]
+        flash = [n for n in names if "flash" in n
+                 and all(x not in n for x in ("lite", "image", "tts", "audio", "live", "exp"))]
+        return sorted(flash, reverse=True)[:3]
+    except Exception as e:
+        print(f"model discovery failed: {e}", file=sys.stderr)
+        return []
+
+
 def summarize_gemini(messages):
     parts = build_gemini_parts(messages)
     last_err = None
-    for model in GEMINI_MODELS:
+    # v3.1: 자동 발견 모델을 우선 시도, 기존 하드코딩 목록은 폴백으로 유지
+    models = []
+    for m in discover_gemini_models() + GEMINI_MODELS:
+        if m not in models:
+            models.append(m)
+    for model in models:
         url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
                f"{model}:generateContent?key={GEMINI_API_KEY}")
         try:
