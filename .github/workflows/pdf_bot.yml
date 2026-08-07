@@ -1,35 +1,35 @@
 name: PDF Summary Bot
-
+# 재발 방지 (2026-08 좀비 런 사태 이후):
+#   1) cancel-in-progress: true → 좀비 런이 슬롯을 잡아도 다음 크론이 대체
+#   2) OS 레벨 timeout 540초(9분) → 크론 주기(10분)보다 먼저 반드시 종료
+#      → 정상 런이 다음 크론에 취소당하는 상황을 구조적으로 차단
+#   3) timeout-minutes: 12 → GitHub 레벨 최후 방어선
 on:
   schedule:
     - cron: "*/10 * * * *"   # 10분 간격 폴링
   workflow_dispatch: {}       # 수동 실행 테스트용
-
 permissions:
   contents: write             # state_pdf.json 커밋용
-
 concurrency:
   group: pdf-bot
-  cancel-in-progress: false
-
+  cancel-in-progress: true    # ★ 핵심 수정: 좀비 런 자동 대체
 jobs:
   pdf:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Run PDF bot
         env:
           PDF_BOT_TOKEN: ${{ secrets.PDF_BOT_TOKEN }}
           ALLOWED_CHAT_ID: ${{ secrets.ALLOWED_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: python pdf_bot.py
-
+        # OS 레벨 방어선: 540초(9분) 후 SIGTERM, 30초 내 미종료 시 SIGKILL
+        # 다음 크론(10분)이 오기 전에 프로세스가 반드시 종료되도록 보장
+        run: timeout -k 30 540 python pdf_bot.py
       - name: Commit state checkpoint
         run: |
           git config user.name "pdf-bot"
@@ -38,7 +38,6 @@ jobs:
           git add state_pdf.json || true
           git diff --cached --quiet || git commit -m "chore: update pdf bot offset [skip ci]"
           git push || true
-
       - name: Failure alert to Telegram
         if: failure()
         env:
