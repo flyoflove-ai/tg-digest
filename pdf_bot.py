@@ -1,9 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-요약 봇 v5 — PDF + 유튜브 링크 요약 (하나의 봇으로 통합)
+요약 봇 v6 — PDF + 유튜브 링크 요약 (하나의 봇으로 통합)
   - PDF 첨부      → 문서 요약 (4MB 초과 시 Files API)
   - 유튜브 링크    → Gemini가 영상을 직접 시청하고 요약 (자막 없어도 가능, 공개 영상만)
   - 모델 자동 탐색: 내 키가 쓸 수 있는 flash 모델을 실행 시 조회, 최신순 시도
+
+v6 변경 (2026-08, 쿼터 소진 무한재시도 사태 이후):
+  - 429 fail-fast: Gemini 429는 20초 후 1회만 재시도, 또 429면 즉시 QuotaExhausted
+    (기존: 35초씩 무한 대기 → 9분 타임아웃 → 10분마다 실패 루프)
+  - 쿼터 소진 시: 미처리 메시지의 오프셋을 보존한 채 exit 0 (정상 종료)
+    → 실패 알림 없음, 다음 크론이 자동 재시도, 쿼터 리셋 후 자동 복구
+  - 쿼터 소진 안내는 하루 1회만 텔레그램 발송 (알림 스팸 방지)
 
 필요 Secrets: PDF_BOT_TOKEN / ALLOWED_CHAT_ID / GEMINI_API_KEY (기존 그대로, 추가 없음)
 """
@@ -28,6 +35,12 @@ GEMINI_BASE = "https://generativelanguage.googleapis.com"
 YOUTUBE_RE = re.compile(
     r"(https?://(?:www\.|m\.)?(?:youtube\.com/(?:watch\?[^ \n]*v=[\w-]{6,}|shorts/[\w-]{6,}|live/[\w-]{6,})|youtu\.be/[\w-]{6,})[^\s]*)"
 )
+
+
+class QuotaExhausted(RuntimeError):
+    """Gemini 일일/분당 쿼터 소진 — 재시도 무의미, 다음 크론으로 이월."""
+    pass
+
 
 def canonical_youtube(url):
     """live/shorts/youtu.be/공유링크를 정식 watch?v= 형태로 변환."""
@@ -84,8 +97,11 @@ def _do_request(url, data=None, headers=None, timeout=300, method=None):
 def http_json(url, payload=None, headers=None, retries=3, timeout=300):
     data = json.dumps(payload).encode() if payload is not None else None
     hdrs = {"Content-Type": "application/json", **(headers or {})}
+    is_gemini = "generativelanguage" in url
     last = None
-    for i in range(retries):
+    retried_429 = False
+    attempt = 0
+    while attempt < retries:
         try:
             raw, _ = _do_request(url, data, hdrs, timeout)
             return json.loads(raw.decode())
@@ -93,19 +109,33 @@ def http_json(url, payload=None, headers=None, retries=3, timeout=300):
             last = e
             msg = str(e)
             if "HTTP 429" in msg:
-                if "limit: 0" in msg:
-                    raise
-                print("⏳ 429 rate limit, 35초 대기 후 재시도")
-                time.sleep(35)
-                continue
-            if i == retries - 1:
+                if is_gemini:
+                    # ---- fail-fast: 20초 후 딱 1회만 재시도, 또 429면 쿼터 소진 판정
+                    if "limit: 0" in msg or retried_429:
+                        raise QuotaExhausted(msg)
+                    retried_429 = True
+                    print("⏳ Gemini 429 → 20초 후 1회만 재시도 (fail-fast)")
+                    time.sleep(20)
+                    continue  # 재시도 횟수 미차감
+                else:
+                    # 텔레그램 flood control 등 — 짧게 대기 후 일반 재시도
+                    attempt += 1
+                    if attempt >= retries:
+                        raise
+                    time.sleep(5)
+                    continue
+            attempt += 1
+            if attempt >= retries:
                 raise
-            time.sleep(2 * (i + 1))
+            time.sleep(2 * attempt)
+        except QuotaExhausted:
+            raise
         except Exception as e:
             last = e
-            if i == retries - 1:
+            attempt += 1
+            if attempt >= retries:
                 raise
-            time.sleep(2 * (i + 1))
+            time.sleep(2 * attempt)
     raise last
 
 
@@ -260,6 +290,7 @@ def extract_text(res):
 
 def gemini_generate(key, models, parts):
     last_err = None
+    quota_hits = 0
     for model in models:
         try:
             res = http_json(
@@ -270,10 +301,17 @@ def gemini_generate(key, models, parts):
                 retries=2)
             print(f"✅ gemini model used: {model}")
             return extract_text(res)
+        except QuotaExhausted as e:
+            print(f"⛔ {model} 쿼터 소진: {str(e)[:200]}", file=sys.stderr)
+            quota_hits += 1
+            last_err = e
+            continue
         except Exception as e:
             print(f"⚠️ {model} 실패: {str(e)[:300]}", file=sys.stderr)
             last_err = e
             continue
+    if quota_hits == len(models):
+        raise QuotaExhausted("모든 모델의 무료 쿼터가 소진되었습니다.")
     raise last_err
 
 
@@ -333,24 +371,32 @@ def main():
             time.sleep(1)
 
     state = load_state()
+    # offset: state에 커밋되는 값 (처리 완료된 메시지까지만 전진)
+    # cursor: getUpdates 순회용 값 (읽기만 한 위치)
+    # → 쿼터 소진으로 중단 시 offset을 전진시키지 않아, 미처리 메시지는
+    #   다음 실행에서 다시 수신되어 자동 재시도됨
     offset = state.get("offset", 0)
+    cursor = offset
     processed = 0
+    quota_stop = False
     now_kst = lambda: datetime.now(KST).strftime("%Y-%m-%d %H:%M")
 
-    while True:
+    while not quota_stop:
         res = http_json(f"{api}/getUpdates",
-                        {"offset": offset + 1, "timeout": 0, "limit": 100,
+                        {"offset": cursor + 1, "timeout": 0, "limit": 100,
                          "allowed_updates": ["message"]})
         updates = res.get("result", [])
         if not updates:
             break
         for u in updates:
-            offset = max(offset, u["update_id"])
+            cursor = max(cursor, u["update_id"])
             msg = u.get("message")
             if not msg:
+                offset = cursor
                 continue
             chat_id = msg.get("chat", {}).get("id")
             if chat_id != allowed_id:
+                offset = cursor
                 continue
 
             doc = msg.get("document")
@@ -362,6 +408,7 @@ def main():
                 fname = doc.get("file_name", "문서.pdf")
                 if doc.get("file_size", 0) > MAX_PDF_BYTES:
                     reply(chat_id, f"⚠️ {fname}: 18MB를 초과해 처리할 수 없습니다.")
+                    offset = cursor
                     continue
                 try:
                     info = http_json(f"{api}/getFile",
@@ -372,9 +419,16 @@ def main():
                     reply(chat_id, f"📑 PDF 요약: {fname}\n🕐 {now_kst()} KST\n"
                                    + "─" * 20 + "\n" + summary)
                     processed += 1
+                    offset = cursor
+                except QuotaExhausted:
+                    print(f"⛔ 쿼터 소진 → {fname} 은(는) 다음 실행에서 재시도",
+                          file=sys.stderr)
+                    quota_stop = True
+                    break
                 except Exception as e:
                     print(f"🔴 pdf failed: {e}", file=sys.stderr)
                     reply(chat_id, f"🔴 {fname} 요약 실패. 잠시 후 다시 보내보세요.")
+                    offset = cursor
                 continue
 
             # ---- 유튜브 처리
@@ -385,10 +439,17 @@ def main():
                     reply(chat_id, f"🎬 영상 요약\n{url}\n🕐 {now_kst()} KST\n"
                                    + "─" * 20 + "\n" + summary)
                     processed += 1
+                    offset = cursor
+                except QuotaExhausted:
+                    print("⛔ 쿼터 소진 → 영상은 다음 실행에서 재시도",
+                          file=sys.stderr)
+                    quota_stop = True
+                    break
                 except Exception as e:
                     print(f"🔴 youtube failed: {e}", file=sys.stderr)
                     reply(chat_id, "🔴 영상 요약 실패. 비공개/멤버십 영상이거나 "
                                    "너무 긴 영상일 수 있습니다. 잠시 후 다시 시도해보세요.")
+                    offset = cursor
                 continue
 
             # ---- 그 외 텍스트: 사용법 안내
@@ -397,13 +458,31 @@ def main():
                                "📄 PDF 파일 첨부 (최대 18MB)\n"
                                "🎬 유튜브 링크 (공개 영상)\n"
                                "답장까지 보통 5~15분 소요됩니다.")
+            offset = cursor
 
         if len(updates) < 100:
             break
 
+    # ---- 쿼터 소진 안내 (하루 1회만)
+    if quota_stop:
+        today = datetime.now(KST).strftime("%Y-%m-%d")
+        if state.get("quota_notice") != today:
+            try:
+                reply(allowed_id,
+                      "⛔ Gemini 무료 일일 쿼터가 소진되었습니다.\n"
+                      "보내주신 자료는 대기열에 보존되어 있으며,\n"
+                      "쿼터 리셋(대략 오후 4~5시 KST) 후 자동으로 요약됩니다.")
+                state["quota_notice"] = today
+            except Exception:
+                pass
+
     state["offset"] = offset
     save_state(state)
-    print(f"✅ 완료: {processed}건 처리, offset={offset}")
+    if quota_stop:
+        print(f"⛔ 쿼터 소진으로 조기 종료 (정상 exit 0): "
+              f"{processed}건 처리, offset={offset} — 미처리분은 다음 실행에서 재시도")
+    else:
+        print(f"✅ 완료: {processed}건 처리, offset={offset}")
 
 
 if __name__ == "__main__":
