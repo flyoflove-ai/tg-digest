@@ -21,6 +21,7 @@ import html
 import json
 import os
 import re
+import signal
 import sys
 import time
 import urllib.request
@@ -48,9 +49,15 @@ GEMINI_FAIL_REASON = ""   # 폴백 시 헤더에 표기
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
-VERSION = "5.2"
+VERSION = "6.0"
 STATE_FILE = "state.json"
 KST = timezone(timedelta(hours=9))
+
+# v6: 전체 실행 시간 상한 (워크플로의 `timeout -k 30 480` 보다 짧게 잡아 exit 124 방지)
+HARD_LIMIT = int(os.environ.get("DIGEST_TIME_LIMIT", "360"))
+SEND_RESERVE = 70          # 발송·저장용으로 남겨둘 시간(초)
+_T0 = time.monotonic()
+_LLM_DEADLINE = None       # summarize_llm 진입 시 설정
 
 MAX_IMAGES = 8               # 회당 Gemini에 넣을 이미지 최대 개수
 MAX_IMAGE_BYTES = 4_000_000  # 이미지 1장 최대 크기 (약 4MB)
@@ -89,7 +96,7 @@ TAG_RE = re.compile(r"</?(b|i|code|u|s)>")
 
 
 # ---------------------------------------------------------------- utils
-def http_json(url, payload=None, headers=None, retries=3):
+def http_json(url, payload=None, headers=None, retries=3, timeout=120):
     # ensure_ascii=True(기본) → 이모지가 \uXXXX 로 이스케이프되어 인코딩 경로와 무관하게 안전
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     req = urllib.request.Request(
@@ -98,7 +105,7 @@ def http_json(url, payload=None, headers=None, retries=3):
     )
     for i in range(retries):
         try:
-            with urllib.request.urlopen(req, timeout=120) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 return json.loads(r.read().decode("utf-8"))
         except Exception:
             if i == retries - 1:
@@ -270,59 +277,83 @@ def _err_code(e):
 RETRYABLE = {"429", "500", "502", "503", "504"}
 
 
-def _call_gemini(model, parts):
+def _left():
+    """LLM 단계에 남은 시간(초). 예산 미설정 시 무한대."""
+    return 10 ** 9 if _LLM_DEADLINE is None else _LLM_DEADLINE - time.monotonic()
+
+
+def _nap(sec, need):
+    """남은 예산이 (대기 + 다음 시도분)보다 클 때만 대기. 대기했으면 True."""
+    if _left() < sec + need:
+        return False
+    time.sleep(sec)
+    return True
+
+
+def _call_gemini(model, parts, timeout):
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
            f"{model}:generateContent?key={GEMINI_API_KEY}")
     res = http_json(url, {"contents": [{"parts": parts}],
                           "generationConfig": {"temperature": 0.3,
-                                               "maxOutputTokens": 8192}}, retries=1)
+                                               "maxOutputTokens": 8192}},
+                    retries=1, timeout=timeout)
     text = res["candidates"][0]["content"]["parts"][0]["text"].strip()
     if len(text) < 200:
         raise RuntimeError("empty/short response")
     return text
 
 
-def summarize_gemini(messages):
-    """모델 목록을 순회하며 요약. 429/5xx는 대기 후 재시도, 전 모델 실패 시 2차 라운드."""
-    global GEMINI_FAIL_REASON
-    parts = build_gemini_parts(messages)
-    last_err, codes, retryable_models = None, [], []
-
+def gemini_models():
     models = []
     for m in discover_gemini_models() + GEMINI_MODELS:
         if m not in models:
             models.append(m)
+    return models
 
-    for rnd in (1, 2):
-        pool = models if rnd == 1 else retryable_models[:2]
-        if rnd == 2:
-            if not pool:
-                break
-            print(f"gemini round 2 after cooldown: {pool}")
-            time.sleep(45)          # 5xx 과부하/분당 한도 회복 대기
-        for model in pool:
-            for attempt in range(3):
-                try:
-                    text = _call_gemini(model, parts)
-                    print(f"gemini model used: {model} (round {rnd})")
-                    return text
-                except Exception as e:
-                    last_err, code = e, _err_code(e)
-                    codes.append(code)
-                    print(f"gemini {model} attempt {attempt + 1}: {code}", file=sys.stderr)
-                    if code in RETRYABLE and attempt < 2:
-                        time.sleep(20 if code != "429" else 30)
-                        continue
-                    if code in RETRYABLE and rnd == 1 and model not in retryable_models:
-                        retryable_models.append(model)   # 2차 라운드 대상 (일시적 실패)
-                    break
 
-    GEMINI_FAIL_REASON = ", ".join(dict.fromkeys(codes))
-    raise last_err
+def summarize_gemini(messages, use_images=True, models=None):
+    """예산 내에서만 시도. 1차: 모델당 1회 빠르게 → 2차: 일시적 실패 모델만 짧게 재시도."""
+    global GEMINI_FAIL_REASON
+    parts = (build_gemini_parts(messages) if use_images
+             else [{"text": PROMPT_HEADER + "\n--- 메시지 시작 ---\n"
+                    + build_text_corpus(messages) + "\n--- 메시지 끝 ---"}])
+    models = models or gemini_models()
+    tag = "img" if use_images else "text"
+    last_err, codes, retryable = None, [], []
+
+    for model in models:                       # 1차: 빠른 스캔
+        if _left() < 20:
+            print(f"gemini({tag}) budget out in pass 1", file=sys.stderr)
+            break
+        try:
+            text = _call_gemini(model, parts, timeout=min(90, max(20, int(_left()) - 10)))
+            print(f"gemini model used: {model} ({tag}, pass 1)")
+            return text
+        except Exception as e:
+            last_err, code = e, _err_code(e)
+            codes.append(code)
+            print(f"gemini {model} ({tag}) pass 1: {code}", file=sys.stderr)
+            if code in RETRYABLE:
+                retryable.append(model)
+
+    for model in retryable[:3]:                # 2차: 과부하/한도만 짧게 재도전
+        if not _nap(12, 40):
+            break
+        try:
+            text = _call_gemini(model, parts, timeout=min(90, max(20, int(_left()) - 10)))
+            print(f"gemini model used: {model} ({tag}, pass 2)")
+            return text
+        except Exception as e:
+            last_err, code = e, _err_code(e)
+            codes.append(code)
+            print(f"gemini {model} ({tag}) pass 2: {code}", file=sys.stderr)
+
+    GEMINI_FAIL_REASON = ", ".join(dict.fromkeys(codes)) or "no-attempt"
+    raise last_err or RuntimeError("gemini: no attempt within budget")
 
 
 def build_text_corpus(messages):
-    """Groq용 텍스트 코퍼스 (이미지는 건수만 표기)."""
+    """텍스트 전용 코퍼스 (이미지는 건수만 표기)."""
     lines, total, n_img = [], 0, 0
     for m in messages:
         if m["image"]:
@@ -337,81 +368,91 @@ def build_text_corpus(messages):
     return head + "\n".join(lines)
 
 
-def summarize_groq(messages):
-    """2차 폴백: Groq 무료 API (OpenAI 호환). 이미지 미지원, 텍스트만 요약."""
-    corpus = PROMPT_HEADER + "\n--- 메시지 시작 ---\n" + build_text_corpus(messages) + "\n--- 메시지 끝 ---"
-    last_err = None
-    for model in GROQ_MODELS:
-        for attempt in range(2):
-            try:
-                res = http_json("https://api.groq.com/openai/v1/chat/completions", {
-                    "model": model,
-                    "messages": [{"role": "user", "content": corpus}],
-                    "temperature": 0.3, "max_tokens": 6000,
-                }, headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, retries=1)
-                text = res["choices"][0]["message"]["content"].strip()
-                if len(text) < 200:
-                    raise RuntimeError("empty/short response")
-                print(f"groq model used: {model}")
-                return text
-            except Exception as e:
-                last_err = e
-                code = _err_code(e)
-                print(f"groq {model} attempt {attempt+1}: {code}", file=sys.stderr)
-                if code == "429" and attempt == 0:
-                    time.sleep(20)
-                    continue
-                break
-    raise last_err
+def _chat_completion(url, key, model, corpus, extra_headers=None):
+    res = http_json(url, {"model": model,
+                          "messages": [{"role": "user", "content": corpus}],
+                          "temperature": 0.3, "max_tokens": 6000},
+                    headers={"Authorization": f"Bearer {key}", **(extra_headers or {})},
+                    retries=1, timeout=min(90, max(20, int(_left()) - 10)))
+    text = res["choices"][0]["message"]["content"].strip()
+    if len(text) < 200:
+        raise RuntimeError("empty/short response")
+    return text
 
 
-def summarize_openrouter(messages):
-    """3차 폴백: OpenRouter 무료 모델 (OpenAI 호환). 텍스트 전용."""
+def _summarize_openai_compatible(name, url, key, models, messages, extra_headers=None):
+    """Groq / OpenRouter 공통 (OpenAI 호환 엔드포인트). 텍스트 전용."""
     corpus = (PROMPT_HEADER + "\n--- 메시지 시작 ---\n"
               + build_text_corpus(messages) + "\n--- 메시지 끝 ---")
     last_err = None
-    for model in OPENROUTER_MODELS:
+    for model in models:
+        if _left() < 30:
+            print(f"{name} budget out", file=sys.stderr)
+            break
         try:
-            res = http_json("https://openrouter.ai/api/v1/chat/completions", {
-                "model": model,
-                "messages": [{"role": "user", "content": corpus}],
-                "temperature": 0.3, "max_tokens": 6000,
-            }, headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                        "HTTP-Referer": "https://github.com/flyoflove-ai/tg-digest",
-                        "X-Title": "tg-digest"}, retries=1)
-            text = res["choices"][0]["message"]["content"].strip()
-            if len(text) < 200:
-                raise RuntimeError("empty/short response")
-            print(f"openrouter model used: {model}")
+            text = _chat_completion(url, key, model, corpus, extra_headers)
+            print(f"{name} model used: {model}")
             return text
         except Exception as e:
             last_err = e
-            print(f"openrouter {model}: {_err_code(e)}", file=sys.stderr)
-    raise last_err
+            code = _err_code(e)
+            print(f"{name} {model}: {code}", file=sys.stderr)
+            if code == "429" and _nap(15, 40):
+                try:
+                    text = _chat_completion(url, key, model, corpus, extra_headers)
+                    print(f"{name} model used: {model} (retry)")
+                    return text
+                except Exception as e2:
+                    last_err = e2
+                    print(f"{name} {model} retry: {_err_code(e2)}", file=sys.stderr)
+    raise last_err or RuntimeError(f"{name}: no attempt within budget")
+
+
+def summarize_groq(messages):
+    return _summarize_openai_compatible(
+        "groq", "https://api.groq.com/openai/v1/chat/completions",
+        GROQ_API_KEY, GROQ_MODELS, messages)
+
+
+def summarize_openrouter(messages):
+    return _summarize_openai_compatible(
+        "openrouter", "https://openrouter.ai/api/v1/chat/completions",
+        OPENROUTER_API_KEY, OPENROUTER_MODELS, messages,
+        {"HTTP-Referer": "https://github.com/flyoflove-ai/tg-digest", "X-Title": "tg-digest"})
 
 
 def summarize_llm(messages):
-    """LLM 요약 체인: Gemini(이미지 포함) → Groq(텍스트) → 실패 시 예외."""
-    global GEMINI_FAIL_REASON
-    errs = []
+    """요약 체인. 각 단계는 남은 시간 예산 안에서만 시도하고, 예산이 없으면 즉시 다음으로 넘어감.
+    Gemini(이미지) → Gemini(텍스트 전용, 페이로드 축소) → Groq → OpenRouter."""
+    global _LLM_DEADLINE, GEMINI_FAIL_REASON
+    _LLM_DEADLINE = _T0 + HARD_LIMIT - SEND_RESERVE
+    print(f"llm budget: {int(_left())}s")
+    errs, has_img = [], any(m["image"] for m in messages)
+
     if GEMINI_API_KEY:
+        models = gemini_models()
         try:
-            return summarize_gemini(messages), "gemini"
+            return summarize_gemini(messages, use_images=True, models=models), "gemini"
         except Exception as e:
             errs.append(f"Gemini {GEMINI_FAIL_REASON or _err_code(e)}")
-            print(f"gemini failed ({e}); try groq", file=sys.stderr)
-    if GROQ_API_KEY:
+            print(f"gemini(img) failed: {e}", file=sys.stderr)
+        if has_img and _left() > 40:   # 이미지 페이로드가 원인일 수 있어 텍스트 전용으로 1회 더
+            try:
+                return summarize_gemini(messages, use_images=False, models=models[:3]), "gemini-text"
+            except Exception as e:
+                errs.append(f"GeminiTxt {GEMINI_FAIL_REASON or _err_code(e)}")
+                print(f"gemini(text) failed: {e}", file=sys.stderr)
+
+    for name, key, fn in (("Groq", GROQ_API_KEY, summarize_groq),
+                          ("OR", OPENROUTER_API_KEY, summarize_openrouter)):
+        if not key:
+            continue
         try:
-            return summarize_groq(messages), "groq"
+            return fn(messages), name.lower().replace("or", "openrouter")
         except Exception as e:
-            errs.append(f"Groq {_err_code(e)}")
-            print(f"groq failed ({e}); try openrouter", file=sys.stderr)
-    if OPENROUTER_API_KEY:
-        try:
-            return summarize_openrouter(messages), "openrouter"
-        except Exception as e:
-            errs.append(f"OR {_err_code(e)}")
-            print(f"openrouter failed ({e}); fallback to rules", file=sys.stderr)
+            errs.append(f"{name} {_err_code(e)}")
+            print(f"{name} failed: {e}", file=sys.stderr)
+
     GEMINI_FAIL_REASON = ", ".join(errs) if errs else "API 키 미설정"
     raise RuntimeError(GEMINI_FAIL_REASON)
 
@@ -606,7 +647,9 @@ def _header(n_msgs, mode):
     now = datetime.now(KST)
     wd = "월화수목금토일"[now.weekday()]
     tag = ""
-    if mode == "groq":
+    if mode == "gemini-text":
+        tag = " · 텍스트모드"
+    elif mode == "groq":
         tag = " · Groq(이미지 제외)"
     elif mode == "openrouter":
         tag = " · OpenRouter(이미지 제외)"
@@ -681,13 +724,23 @@ def save_digest(summary_html):
         print(f"digest save failed (발송에는 영향 없음): {e}", file=sys.stderr)
 
 
+def _on_signal(signum, frame):
+    raise TimeoutError(f"signal {signum} (시간 초과)")
+
+
 def main():
-    print(f"digest v{VERSION} | gemini key: {GEMINI_KEY_SOURCE}")
+    print(f"digest v{VERSION} | gemini key: {GEMINI_KEY_SOURCE} | limit {HARD_LIMIT}s")
+    # 워크플로 timeout(exit 124)로 강제 종료되기 전에 스스로 마무리하도록 알람 설정
+    signal.signal(signal.SIGALRM, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.alarm(HARD_LIMIT)
+
     state = load_state()
     messages = collect_messages(state)
     print(f"collected: {len(messages)} messages, offset={state['offset']}")
 
     if not messages:
+        signal.alarm(0)
         save_state(state)
         print("no new messages; skip sending")
         return
@@ -695,14 +748,18 @@ def main():
     try:
         raw, mode = summarize_llm(messages)
         summary = format_gemini(raw)
-    except Exception as e:
-        print(f"all LLMs failed ({e}); fallback to rules", file=sys.stderr)
+    except BaseException as e:          # TimeoutError 포함 — 어떤 경우에도 발송은 한다
+        print(f"LLM stage aborted ({e}); fallback to rules", file=sys.stderr)
         summary, mode = summarize_rules(messages), "rules"
 
-    send(summary, len(messages), mode)
-    save_digest(summary)
-    save_state(state)
-    print("done")
+    signal.alarm(90)                    # 발송 단계는 별도 여유 시간
+    try:
+        send(summary, len(messages), mode)
+        save_digest(summary)
+        save_state(state)               # 발송 성공 시에만 offset 확정 (실패 시 다음 회차 재시도)
+        print(f"done in {int(time.monotonic() - _T0)}s (mode={mode})")
+    finally:
+        signal.alarm(0)
 
 
 if __name__ == "__main__":
