@@ -29,14 +29,23 @@ from datetime import datetime, timezone, timedelta
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"])
 TARGET_CHAT_ID = os.environ["TARGET_CHAT_ID"]
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+# v5.1: tg-digest 전용 키 분리 — GEMINI_API_KEY_DIGEST 가 있으면 우선 사용,
+# 없으면 기존 공용 GEMINI_API_KEY 로 폴백 (다른 봇들은 영향 없음)
+GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY_DIGEST", "").strip()
+                  or os.environ.get("GEMINI_API_KEY", "").strip())
+GEMINI_KEY_SOURCE = ("dedicated" if os.environ.get("GEMINI_API_KEY_DIGEST", "").strip()
+                     else ("shared" if os.environ.get("GEMINI_API_KEY", "").strip() else "none"))
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()   # 2차 폴백 (무료, 텍스트 전용)
+GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 
 GEMINI_MODELS = [m for m in [os.environ.get("GEMINI_MODEL", "")] if m] + [
-    "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash",
+    "gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash-lite",
 ]
+GEMINI_FAIL_REASON = ""   # 폴백 시 헤더에 표기
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
+VERSION = "5.1"
 STATE_FILE = "state.json"
 KST = timezone(timedelta(hours=9))
 
@@ -64,9 +73,8 @@ SECTOR_ICON = {
 }
 CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮"
 
-TITLE_LEN = 46       # 항목 제목 최대 길이
-BODY_LEN = 170       # 항목 본문(한 덩어리일 때) 최대 길이
-SUBLINE_LEN = 95     # 불릿 전개 시 줄당 최대 길이
+TITLE_LEN = 60       # 항목 제목 최대 길이
+SUBLINE_LEN = 140    # 불릿 전개 시 줄당 최대 길이
 MAX_PER_SECTOR = 8   # 섹터당 최대 항목 수
 TG_LIMIT = 3900      # 텔레그램 메시지 분할 기준
 
@@ -229,16 +237,25 @@ def discover_gemini_models():
         names = [m["name"].split("/")[-1] for m in res.get("models", [])
                  if "generateContent" in m.get("supportedGenerationMethods", [])]
         flash = [n for n in names if "flash" in n
-                 and all(x not in n for x in ("lite", "image", "tts", "audio", "live", "exp"))]
-        return sorted(flash, reverse=True)[:3]
+                 and all(x not in n for x in ("image", "tts", "audio", "live", "exp"))]
+        # 정식 flash 우선, lite(별도 쿼터)는 뒤에 폴백으로
+        main = sorted([n for n in flash if "lite" not in n], reverse=True)[:3]
+        lite = sorted([n for n in flash if "lite" in n], reverse=True)[:2]
+        return main + lite
     except Exception as e:
         print(f"model discovery failed: {e}", file=sys.stderr)
         return []
 
 
+def _err_code(e):
+    m = re.search(r"HTTP Error (\d{3})", str(e))
+    return m.group(1) if m else type(e).__name__
+
+
 def summarize_gemini(messages):
+    global GEMINI_FAIL_REASON
     parts = build_gemini_parts(messages)
-    last_err = None
+    last_err, reasons = None, []
     models = []
     for m in discover_gemini_models() + GEMINI_MODELS:
         if m not in models:
@@ -246,18 +263,90 @@ def summarize_gemini(messages):
     for model in models:
         url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
                f"{model}:generateContent?key={GEMINI_API_KEY}")
-        try:
-            res = http_json(url, {
-                "contents": [{"parts": parts}],
-                "generationConfig": {"temperature": 0.3,
-                                     "maxOutputTokens": 8192},
-            }, retries=1)
-            print(f"gemini model used: {model}")
-            return res["candidates"][0]["content"]["parts"][0]["text"].strip()
-        except Exception as e:
-            last_err = e
-            continue
+        body = {"contents": [{"parts": parts}],
+                "generationConfig": {"temperature": 0.3, "maxOutputTokens": 8192}}
+        for attempt in range(3):          # 429(분당 한도)는 30초 대기 후 재시도
+            try:
+                res = http_json(url, body, retries=1)
+                text = res["candidates"][0]["content"]["parts"][0]["text"].strip()
+                if len(text) < 200:
+                    raise RuntimeError("empty/short response")
+                print(f"gemini model used: {model}")
+                return text
+            except Exception as e:
+                last_err, code = e, _err_code(e)
+                print(f"gemini {model} attempt {attempt+1}: {code}", file=sys.stderr)
+                if code == "429" and attempt < 2:
+                    time.sleep(30)
+                    continue
+                reasons.append(f"{model}:{code}")
+                break
+    GEMINI_FAIL_REASON = ", ".join(dict.fromkeys(r.split(":")[1] for r in reasons))
     raise last_err
+
+
+def build_text_corpus(messages):
+    """Groq용 텍스트 코퍼스 (이미지는 건수만 표기)."""
+    lines, total, n_img = [], 0, 0
+    for m in messages:
+        if m["image"]:
+            n_img += 1
+        line = f"[{m['time']}] {m['sender']}: {m['text'][:2000]}"
+        total += len(line)
+        if total > 90_000:
+            lines.append("(이후 메시지 생략 - 분량 초과)")
+            break
+        lines.append(line)
+    head = f"(이미지 {n_img}건은 텍스트 전용 모드라 분석 제외)\n" if n_img else ""
+    return head + "\n".join(lines)
+
+
+def summarize_groq(messages):
+    """2차 폴백: Groq 무료 API (OpenAI 호환). 이미지 미지원, 텍스트만 요약."""
+    corpus = PROMPT_HEADER + "\n--- 메시지 시작 ---\n" + build_text_corpus(messages) + "\n--- 메시지 끝 ---"
+    last_err = None
+    for model in GROQ_MODELS:
+        for attempt in range(2):
+            try:
+                res = http_json("https://api.groq.com/openai/v1/chat/completions", {
+                    "model": model,
+                    "messages": [{"role": "user", "content": corpus}],
+                    "temperature": 0.3, "max_tokens": 6000,
+                }, headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, retries=1)
+                text = res["choices"][0]["message"]["content"].strip()
+                if len(text) < 200:
+                    raise RuntimeError("empty/short response")
+                print(f"groq model used: {model}")
+                return text
+            except Exception as e:
+                last_err = e
+                code = _err_code(e)
+                print(f"groq {model} attempt {attempt+1}: {code}", file=sys.stderr)
+                if code == "429" and attempt == 0:
+                    time.sleep(20)
+                    continue
+                break
+    raise last_err
+
+
+def summarize_llm(messages):
+    """LLM 요약 체인: Gemini(이미지 포함) → Groq(텍스트) → 실패 시 예외."""
+    global GEMINI_FAIL_REASON
+    errs = []
+    if GEMINI_API_KEY:
+        try:
+            return summarize_gemini(messages), "gemini"
+        except Exception as e:
+            errs.append(f"Gemini {GEMINI_FAIL_REASON or _err_code(e)}")
+            print(f"gemini failed ({e}); try groq", file=sys.stderr)
+    if GROQ_API_KEY:
+        try:
+            return summarize_groq(messages), "groq"
+        except Exception as e:
+            errs.append(f"Groq {_err_code(e)}")
+            print(f"groq failed ({e}); fallback to rules", file=sys.stderr)
+    GEMINI_FAIL_REASON = ", ".join(errs) if errs else "API 키 미설정"
+    raise RuntimeError(GEMINI_FAIL_REASON)
 
 
 # ---------------------------------------------------------------- format helpers
@@ -268,52 +357,93 @@ def _clean(text):
     return MULTI_NL_RE.sub("\n", t).strip(" \n-–—·•▪|")
 
 
-def _cut(s, n):
-    """n자 안에서 문장/어절 경계로 자르고 … 부착."""
+KEY_WORDS = ["목표주가", "TP", "상승여력", "매수", "Buy", "중립", "Neutral", "매도", "Sell",
+             "영업이익", "매출", "실적", "컨센", "수주", "계약", "공시", "발표", "확정", "전망",
+             "증가", "감소", "상향", "하향", "개시", "유지", "억원", "조원", "달러", "%", "YoY", "QoQ",
+             "Overweight", "Underweight", "커버리지", "투자의견", "배당", "자사주", "소각",
+             "예정", "계획", "협의", "체결", "가이던스", "점유율", "출하"]
+SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+|(?<=[가-힣a-z\)][.!?])(?=[가-힣A-Z])")
+LABEL_RE = re.compile(r"^[\[\(【]?[^\]\)】]{0,14}[\]\)】]?\s*$")   # '새로운 소식', '[1]' 같은 짧은 라벨
+
+
+def _sentences(text):
+    out = []
+    for s in SENT_SPLIT_RE.split(text or ""):
+        s = (s or "").strip(" -–—•▪·|")
+        if len(s) < 10 or LABEL_RE.match(s) and not re.search(r"\d", s):
+            continue
+        out.append(s)
+    return out
+
+
+def _score(s, idx):
+    sc = 0
+    sc += 3 if re.search(r"\d", s) else 0
+    sc += 2 * sum(1 for k in KEY_WORDS if k.lower() in s.lower())
+    sc += 1 if idx == 0 else 0
+    sc -= 2 if len(s) > 220 else 0
+    sc -= 4 if re.search(r"다음과 같|\[\d\]", s) else 0   # 목차성 문장 제외
+    return sc
+
+
+def _trim(s, n):
+    """n자 초과 시 절/문장 경계에서 자르되 말줄임표 없이 완결된 구로 마무리."""
     s = s.strip()
     if len(s) <= n:
         return s
     head = s[:n]
-    for sep in ("다. ", "요. ", ". ", "! ", "? ", ") ", "; "):
+    for sep in ("다.", "요.", ". ", "; ", "), ", ", "):
         i = head.rfind(sep)
-        if i >= n * 0.5:
-            return head[: i + len(sep) - 1].rstrip() + " …"
+        if i >= n * 0.45:
+            return head[: i + len(sep)].rstrip(", ;")
     i = head.rfind(" ")
-    if i >= n * 0.6:
-        head = head[:i]
-    return head.rstrip() + " …"
+    return head[:i if i >= n * 0.6 else n].rstrip(",;· ")
+
+
+def _key_points(text, k=4, budget=480):
+    """핵심 문장 추출: 수치·목표주가·투자의견·수주 등 팩트가 담긴 문장을 우선, 원문 순서로 최대 k개."""
+    sents = _sentences(text)
+    if not sents:
+        return []
+    ranked = sorted(range(len(sents)), key=lambda i: (-_score(sents[i], i), i))
+    chosen = sorted(ranked[:k])
+    out, used = [], 0
+    for i in chosen:
+        s = _trim(sents[i], 200)
+        if used + len(s) > budget and out:
+            break
+        out.append(s)
+        used += len(s)
+    return out
 
 
 def _split_title_body(text):
-    """첫 줄(또는 첫 문장)을 제목으로, 나머지를 본문으로. 제목이 잘리면 잘린 부분은 본문으로."""
-    lines = [ln for ln in text.split("\n") if ln.strip()]
+    """제목 = 첫 문장(라벨/이모지 제거, 최대 TITLE_LEN, 말줄임 없음). 본문 = 나머지 전체."""
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
     if not lines:
         return "", ""
-    first, rest_lines = LEAD_EMOJI_RE.sub("", lines[0]), lines[1:]
-    if len(first) <= TITLE_LEN:
-        title, rest = first, ""
-    else:
-        m = re.match(r"(.{8,%d}?[.다요!?\"”])(\s|$)" % TITLE_LEN, first)
-        if m:
-            title, rest = m.group(1), first[m.end():]
-        else:
-            cut = first.rfind(" ", 0, TITLE_LEN)
-            cut = cut if cut >= TITLE_LEN * 0.5 else TITLE_LEN
-            title, rest = first[:cut].rstrip() + " …", first[cut:]
-    body = "\n".join(([rest.strip()] if rest.strip() else []) + rest_lines)
+    first = LEAD_EMOJI_RE.sub("", lines[0])
+    first = re.sub(r"^\[?\s*(속보|단독|공유|종목|시황)\s*\]?\s*", "", first)
+    sents = _sentences(first) or [first]
+    title = _trim(sents[0], TITLE_LEN)
+    rest_first = first[len(sents[0]):].strip() if first.startswith(sents[0]) else first
+    body = "\n".join(([rest_first] if rest_first and rest_first != first else []) + lines[1:])
+    if not lines[1:] and rest_first == first and len(first) > len(title) + 10:
+        body = first          # 첫 줄이 제목보다 훨씬 길면 본문에도 실어 핵심을 뽑게 함
     return title, body.strip()
 
 
-def _body_lines(body, n_max=4):
-    """본문에 불릿(•/▪/-)이 2개 이상이면 줄 단위로 전개, 아니면 한 덩어리."""
+def _body_lines(body, title=""):
+    """불릿(•/▪/-)이 2개 이상이면 불릿 단위 그대로, 아니면 핵심 문장 추출."""
     parts = [p.strip(" •▪·-–") for p in
              re.split(r"\s*(?:^|\n|\s)[•▪·]\s*|\n\s*[-–]\s+", body) if p.strip(" •▪·-–")]
     if len(parts) >= 2:
-        out = ["· " + _cut(p, SUBLINE_LEN) for p in parts[:n_max]]
-        if len(parts) > n_max:
-            out.append(f"· … 외 {len(parts) - n_max}개")
+        out = ["· " + _trim(p, SUBLINE_LEN) for p in parts[:5]]
+        if len(parts) > 5:
+            out.append(f"· 외 {len(parts) - 5}개 항목")
         return out
-    return [_cut(body, BODY_LEN)]
+    pts = [p for p in _key_points(body) if _norm_key(p) != _norm_key(title)]
+    return ["· " + p for p in pts]
 
 
 def _norm_key(s):
@@ -357,7 +487,7 @@ def summarize_rules(messages):
             if it["time"]:
                 line += f"  <i>{it['time']}</i>"
             block.append(line)
-            for bl in _body_lines(body) if body else []:
+            for bl in _body_lines(body, title) if body else []:
                 block.append("    " + html.escape(bl))
         if len(items) > MAX_PER_SECTOR:
             block.append(f"    <i>… 외 {len(items) - MAX_PER_SECTOR}건</i>")
@@ -408,9 +538,13 @@ def format_gemini(text):
 def _header(n_msgs, mode):
     now = datetime.now(KST)
     wd = "월화수목금토일"[now.weekday()]
-    tag = " · 규칙모드" if mode == "rules" else ""
+    tag = ""
+    if mode == "groq":
+        tag = " · Groq(이미지 제외)"
+    elif mode == "rules":
+        tag = " · 규칙모드" + (f" ({GEMINI_FAIL_REASON})" if GEMINI_FAIL_REASON else "")
     return (f"<b>📰 텔레방 요약</b>  {now:%m/%d}({wd}) {now:%H:%M}{tag}\n"
-            f"📥 수집 {n_msgs}건\n"
+            f"📥 수집 {n_msgs}건 · v{VERSION}\n"
             "━━━━━━━━━━━━━━━━")
 
 
@@ -479,6 +613,7 @@ def save_digest(summary_html):
 
 
 def main():
+    print(f"digest v{VERSION} | gemini key: {GEMINI_KEY_SOURCE}")
     state = load_state()
     messages = collect_messages(state)
     print(f"collected: {len(messages)} messages, offset={state['offset']}")
@@ -488,15 +623,12 @@ def main():
         print("no new messages; skip sending")
         return
 
-    mode = "rules"
-    summary = None
-    if GEMINI_API_KEY:
-        try:
-            summary, mode = format_gemini(summarize_gemini(messages)), "gemini"
-        except Exception as e:
-            print(f"gemini failed ({e}); fallback to rules", file=sys.stderr)
-    if summary is None:
-        summary = summarize_rules(messages)
+    try:
+        raw, mode = summarize_llm(messages)
+        summary = format_gemini(raw)
+    except Exception as e:
+        print(f"all LLMs failed ({e}); fallback to rules", file=sys.stderr)
+        summary, mode = summarize_rules(messages), "rules"
 
     send(summary, len(messages), mode)
     save_digest(summary)
