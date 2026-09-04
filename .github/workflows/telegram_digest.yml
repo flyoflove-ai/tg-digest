@@ -32,6 +32,8 @@ jobs:
           SOURCE_CHAT_ID: ${{ secrets.SOURCE_CHAT_ID }}
           TARGET_CHAT_ID: ${{ secrets.TARGET_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY_DIGEST: ${{ secrets.GEMINI_API_KEY_DIGEST }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         # OS 레벨 방어선: 480초(8분) 후 SIGTERM, 30초 내 미종료 시 SIGKILL
         run: timeout -k 30 480 python digest.py
       - name: Commit state checkpoint
