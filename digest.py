@@ -37,6 +37,9 @@ GEMINI_KEY_SOURCE = ("dedicated" if os.environ.get("GEMINI_API_KEY_DIGEST", "").
                      else ("shared" if os.environ.get("GEMINI_API_KEY", "").strip() else "none"))
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()   # 2차 폴백 (무료, 텍스트 전용)
 GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()  # 3차 폴백 (무료 모델)
+OPENROUTER_MODELS = ["meta-llama/llama-3.3-70b-instruct:free",
+                     "google/gemini-2.0-flash-exp:free"]
 
 GEMINI_MODELS = [m for m in [os.environ.get("GEMINI_MODEL", "")] if m] + [
     "gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash-lite",
@@ -45,7 +48,7 @@ GEMINI_FAIL_REASON = ""   # 폴백 시 헤더에 표기
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
-VERSION = "5.1"
+VERSION = "5.2"
 STATE_FILE = "state.json"
 KST = timezone(timedelta(hours=9))
 
@@ -229,19 +232,31 @@ def build_gemini_parts(messages):
     return parts
 
 
+BAD_TOKENS = ("image", "tts", "audio", "live", "exp", "embedding", "thinking",
+              "preview", "omni", "learnlm", "vision")
+
+
+def _rank(name):
+    """낮을수록 우선. 무료 티어에서 안정적인 정식 모델을 앞세운다."""
+    ver = re.search(r"(\d+)\.(\d+)", name)
+    v = int(ver.group(1)) * 10 + int(ver.group(2)) if ver else 0
+    lite = 1 if "lite" in name else 0
+    latest = 0 if name.endswith("-latest") else 1   # -latest 별칭이 가장 잘 살아있음
+    return (lite, latest, -v, name)
+
+
 def discover_gemini_models():
-    """ListModels API로 사용 가능한 flash 모델 조회 — 모델 지원 종료 대응."""
+    """ListModels로 사용 가능한 flash 계열 조회. preview/omni는 무료 쿼터가 매우 작아 제외."""
     try:
         res = http_json("https://generativelanguage.googleapis.com/v1beta/models"
                         f"?key={GEMINI_API_KEY}&pageSize=200")
         names = [m["name"].split("/")[-1] for m in res.get("models", [])
                  if "generateContent" in m.get("supportedGenerationMethods", [])]
         flash = [n for n in names if "flash" in n
-                 and all(x not in n for x in ("image", "tts", "audio", "live", "exp"))]
-        # 정식 flash 우선, lite(별도 쿼터)는 뒤에 폴백으로
-        main = sorted([n for n in flash if "lite" not in n], reverse=True)[:3]
-        lite = sorted([n for n in flash if "lite" in n], reverse=True)[:2]
-        return main + lite
+                 and all(x not in n for x in BAD_TOKENS)]
+        ranked = sorted(set(flash), key=_rank)
+        print(f"gemini candidates: {ranked[:5]}")
+        return ranked[:5]
     except Exception as e:
         print(f"model discovery failed: {e}", file=sys.stderr)
         return []
@@ -252,36 +267,57 @@ def _err_code(e):
     return m.group(1) if m else type(e).__name__
 
 
+RETRYABLE = {"429", "500", "502", "503", "504"}
+
+
+def _call_gemini(model, parts):
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{model}:generateContent?key={GEMINI_API_KEY}")
+    res = http_json(url, {"contents": [{"parts": parts}],
+                          "generationConfig": {"temperature": 0.3,
+                                               "maxOutputTokens": 8192}}, retries=1)
+    text = res["candidates"][0]["content"]["parts"][0]["text"].strip()
+    if len(text) < 200:
+        raise RuntimeError("empty/short response")
+    return text
+
+
 def summarize_gemini(messages):
+    """모델 목록을 순회하며 요약. 429/5xx는 대기 후 재시도, 전 모델 실패 시 2차 라운드."""
     global GEMINI_FAIL_REASON
     parts = build_gemini_parts(messages)
-    last_err, reasons = None, []
+    last_err, codes, retryable_models = None, [], []
+
     models = []
     for m in discover_gemini_models() + GEMINI_MODELS:
         if m not in models:
             models.append(m)
-    for model in models:
-        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-               f"{model}:generateContent?key={GEMINI_API_KEY}")
-        body = {"contents": [{"parts": parts}],
-                "generationConfig": {"temperature": 0.3, "maxOutputTokens": 8192}}
-        for attempt in range(3):          # 429(분당 한도)는 30초 대기 후 재시도
-            try:
-                res = http_json(url, body, retries=1)
-                text = res["candidates"][0]["content"]["parts"][0]["text"].strip()
-                if len(text) < 200:
-                    raise RuntimeError("empty/short response")
-                print(f"gemini model used: {model}")
-                return text
-            except Exception as e:
-                last_err, code = e, _err_code(e)
-                print(f"gemini {model} attempt {attempt+1}: {code}", file=sys.stderr)
-                if code == "429" and attempt < 2:
-                    time.sleep(30)
-                    continue
-                reasons.append(f"{model}:{code}")
+
+    for rnd in (1, 2):
+        pool = models if rnd == 1 else retryable_models[:2]
+        if rnd == 2:
+            if not pool:
                 break
-    GEMINI_FAIL_REASON = ", ".join(dict.fromkeys(r.split(":")[1] for r in reasons))
+            print(f"gemini round 2 after cooldown: {pool}")
+            time.sleep(45)          # 5xx 과부하/분당 한도 회복 대기
+        for model in pool:
+            for attempt in range(3):
+                try:
+                    text = _call_gemini(model, parts)
+                    print(f"gemini model used: {model} (round {rnd})")
+                    return text
+                except Exception as e:
+                    last_err, code = e, _err_code(e)
+                    codes.append(code)
+                    print(f"gemini {model} attempt {attempt + 1}: {code}", file=sys.stderr)
+                    if code in RETRYABLE and attempt < 2:
+                        time.sleep(20 if code != "429" else 30)
+                        continue
+                    if code in RETRYABLE and rnd == 1 and model not in retryable_models:
+                        retryable_models.append(model)   # 2차 라운드 대상 (일시적 실패)
+                    break
+
+    GEMINI_FAIL_REASON = ", ".join(dict.fromkeys(codes))
     raise last_err
 
 
@@ -329,6 +365,31 @@ def summarize_groq(messages):
     raise last_err
 
 
+def summarize_openrouter(messages):
+    """3차 폴백: OpenRouter 무료 모델 (OpenAI 호환). 텍스트 전용."""
+    corpus = (PROMPT_HEADER + "\n--- 메시지 시작 ---\n"
+              + build_text_corpus(messages) + "\n--- 메시지 끝 ---")
+    last_err = None
+    for model in OPENROUTER_MODELS:
+        try:
+            res = http_json("https://openrouter.ai/api/v1/chat/completions", {
+                "model": model,
+                "messages": [{"role": "user", "content": corpus}],
+                "temperature": 0.3, "max_tokens": 6000,
+            }, headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                        "HTTP-Referer": "https://github.com/flyoflove-ai/tg-digest",
+                        "X-Title": "tg-digest"}, retries=1)
+            text = res["choices"][0]["message"]["content"].strip()
+            if len(text) < 200:
+                raise RuntimeError("empty/short response")
+            print(f"openrouter model used: {model}")
+            return text
+        except Exception as e:
+            last_err = e
+            print(f"openrouter {model}: {_err_code(e)}", file=sys.stderr)
+    raise last_err
+
+
 def summarize_llm(messages):
     """LLM 요약 체인: Gemini(이미지 포함) → Groq(텍스트) → 실패 시 예외."""
     global GEMINI_FAIL_REASON
@@ -344,7 +405,13 @@ def summarize_llm(messages):
             return summarize_groq(messages), "groq"
         except Exception as e:
             errs.append(f"Groq {_err_code(e)}")
-            print(f"groq failed ({e}); fallback to rules", file=sys.stderr)
+            print(f"groq failed ({e}); try openrouter", file=sys.stderr)
+    if OPENROUTER_API_KEY:
+        try:
+            return summarize_openrouter(messages), "openrouter"
+        except Exception as e:
+            errs.append(f"OR {_err_code(e)}")
+            print(f"openrouter failed ({e}); fallback to rules", file=sys.stderr)
     GEMINI_FAIL_REASON = ", ".join(errs) if errs else "API 키 미설정"
     raise RuntimeError(GEMINI_FAIL_REASON)
 
@@ -541,6 +608,8 @@ def _header(n_msgs, mode):
     tag = ""
     if mode == "groq":
         tag = " · Groq(이미지 제외)"
+    elif mode == "openrouter":
+        tag = " · OpenRouter(이미지 제외)"
     elif mode == "rules":
         tag = " · 규칙모드" + (f" ({GEMINI_FAIL_REASON})" if GEMINI_FAIL_REASON else "")
     return (f"<b>📰 텔레방 요약</b>  {now:%m/%d}({wd}) {now:%H:%M}{tag}\n"
